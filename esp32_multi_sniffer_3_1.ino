@@ -62,8 +62,8 @@ const char* sta_password = "HOME_PASSWORD"; // <- Change to your WiFi password
 // --- NTFY SETTINGS ---
 // IMPORTANT: Change the topic name below to something unique (e.g. "MyHome-Sniffer-42")
 // so you don't share the channel with other users!
-const char* ntfyTopic = "ESP32-MultiSniffer";    // <- Change this to YOUR OWN unique topic name!
-const char* ntfyCmdTopic = "ESP32-MultiSniffer";  // <- Must be the SAME as ntfyTopic above!
+const char* ntfyTopic = "MultiSniffer";    // <- Change this to YOUR OWN unique topic name!
+const char* ntfyCmdTopic = "MultiSniffer";  // <- Must be the SAME as ntfyTopic above!
 bool ntfyEnabled = false;
 bool staConnected = false;
 bool ntpSynced = false;
