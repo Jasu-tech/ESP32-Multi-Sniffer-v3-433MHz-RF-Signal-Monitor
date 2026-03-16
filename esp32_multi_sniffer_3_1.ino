@@ -1,5 +1,5 @@
 /*
- * ESP32 Multi-Sniffer v3 - 433MHz RF Signal Monitor
+ * ESP32 Multi-Sniffer v4 - 433MHz RF Signal Monitor
  * 
  * Multi-radio 433MHz RF signal monitoring system using ESP32 and CC1101
  * radio modules. Supports up to 3 simultaneous CC1101 radios with
@@ -53,7 +53,7 @@
 
 // --- AP SETTINGS (Web UI) --- <- Change what you like
 const char* ap_ssid = "ESP32-Multi-Sniffer";
-const char* ap_password = "ESP3admin";
+const char* ap_password = "ESP32admin";
 
 // --- STA SETTINGS (Internet/ntfy) ---
 const char* sta_ssid = "HOME_WIFI";       // <- Change to your WiFi name
@@ -110,6 +110,7 @@ struct SignalLog {
 
 // Radio states (defaults)
 int radioModulation[4] = {0, 2, 0, 2}; // Index 1-3. 2=ASK, 0=FSK
+float radioFrequency[4] = {0, 433.92, 433.92, 433.92}; // MHz per radio (index 1-3)
 bool radioPresent[4] = {false, false, false, false}; // Is radio connected?
 String radioModeName[4] = {"", "ASK/OOK", "2-FSK", "Wideband ASK"};
 
@@ -121,6 +122,120 @@ int rssiThreshold = -60; // Default threshold, adjustable from web UI
 bool rssiLocked = true; // RSSI slider lock (locked by default)
 
 RCSwitch mySwitch = RCSwitch();
+int rawCooldown = 0;
+int rawConfirmCount = 0;
+
+// --- CODEBOOK (stores unique decoded signals, no RAW) ---
+struct CodebookEntry {
+  long value;
+  int bitLength;
+  int protocol;
+  int rssi;
+  float frequency;
+  unsigned long firstSeen;
+  unsigned long lastSeen;
+  int hitCount;
+  char deviceType[32];
+};
+const int CODEBOOK_SIZE = 50;
+CodebookEntry codebook[CODEBOOK_SIZE];
+int codebookCount = 0;
+
+int codebookAdd(long value, int bitLength, int protocol, int rssi, float freq, const char* device) {
+  for (int i = 0; i < codebookCount; i++) {
+    if (codebook[i].value == value && codebook[i].protocol == protocol) {
+      codebook[i].lastSeen = getTimestamp();
+      codebook[i].hitCount++;
+      if (rssi > codebook[i].rssi) codebook[i].rssi = rssi;
+      return i;
+    }
+  }
+  if (codebookCount < CODEBOOK_SIZE) {
+    int idx = codebookCount;
+    codebook[idx].value = value;
+    codebook[idx].bitLength = bitLength;
+    codebook[idx].protocol = protocol;
+    codebook[idx].rssi = rssi;
+    codebook[idx].frequency = freq;
+    codebook[idx].firstSeen = getTimestamp();
+    codebook[idx].lastSeen = getTimestamp();
+    codebook[idx].hitCount = 1;
+    strncpy(codebook[idx].deviceType, device, 31);
+    codebook[idx].deviceType[31] = '\0';
+    codebookCount++;
+    Serial.printf("Codebook: added %ld (%s) [%d/%d]\n", value, device, codebookCount, CODEBOOK_SIZE);
+    return idx;
+  }
+  return -1;
+}
+
+// --- STATISTICS ---
+struct Stats {
+  unsigned long totalDecoded;
+  unsigned long totalRaw;
+  unsigned long radioDecoded[4]; // per radio 1-3
+  unsigned long radioRaw[4];
+  unsigned long hourlyDecoded[24]; // signals per hour (0-23)
+  unsigned long hourlyRaw[24];
+  int currentHour;
+  unsigned long uptimeStart;
+};
+Stats stats;
+
+void statsInit() {
+  memset(&stats, 0, sizeof(stats));
+  stats.currentHour = -1;
+  stats.uptimeStart = millis();
+}
+
+void statsRecord(int radioId, bool isRaw) {
+  if (isRaw) {
+    stats.totalRaw++;
+    if (radioId >= 1 && radioId <= 3) stats.radioRaw[radioId]++;
+  } else {
+    stats.totalDecoded++;
+    if (radioId >= 1 && radioId <= 3) stats.radioDecoded[radioId]++;
+  }
+  if (ntpSynced) {
+    time_t now;
+    time(&now);
+    struct tm* t = localtime(&now);
+    int h = t->tm_hour;
+    if (stats.currentHour != h) {
+      stats.hourlyDecoded[h] = 0;
+      stats.hourlyRaw[h] = 0;
+      stats.currentHour = h;
+    }
+    if (isRaw) stats.hourlyRaw[h]++;
+    else stats.hourlyDecoded[h]++;
+  }
+}
+
+// --- RSSI HISTORY per codebook entry ---
+const int RSSI_HIST_LEN = 20;
+struct RssiHistory {
+  int rssi[RSSI_HIST_LEN];
+  unsigned long ts[RSSI_HIST_LEN];
+  int count;
+};
+RssiHistory rssiHist[CODEBOOK_SIZE];
+
+void rssiHistAdd(int cbIndex, int rssi) {
+  if (cbIndex < 0 || cbIndex >= CODEBOOK_SIZE) return;
+  RssiHistory &rh = rssiHist[cbIndex];
+  if (rh.count < RSSI_HIST_LEN) {
+    rh.rssi[rh.count] = rssi;
+    rh.ts[rh.count] = getTimestamp();
+    rh.count++;
+  } else {
+    for (int i = 0; i < RSSI_HIST_LEN - 1; i++) {
+      rh.rssi[i] = rh.rssi[i+1];
+      rh.ts[i] = rh.ts[i+1];
+    }
+    rh.rssi[RSSI_HIST_LEN-1] = rssi;
+    rh.ts[RSSI_HIST_LEN-1] = getTimestamp();
+  }
+}
 
 // Returns epoch seconds (NTP) or millis/1000 if not synced
 unsigned long getTimestamp() {
@@ -252,9 +367,9 @@ void handleNtfyCommand(String cmd) {
   Serial.printf("ntfy CMD: '%s'\n", cmd.c_str());
   
   if (cmd == "status") {
-    char msg[200];
-    snprintf(msg, sizeof(msg), "Radio1: %s (%s) | RSSI: %d dBm | Signals: %d | ntfy: %s | STA: %s",
-      radioPresent[1] ? "OK" : "OFF", radioModeName[1].c_str(),
+    char msg[250];
+    snprintf(msg, sizeof(msg), "Radio1: %s (%s %.0fMHz) | RSSI: %d dBm | Signals: %d | ntfy: %s | STA: %s",
+      radioPresent[1] ? "OK" : "OFF", radioModeName[1].c_str(), radioFrequency[1],
       rssiThreshold, historyIndex,
       ntfyEnabled ? "ON" : "OFF",
       staConnected ? "connected" : "disconnected");
@@ -313,12 +428,27 @@ void handleNtfyCommand(String cmd) {
     ESP.restart();
   }
   else if (cmd == "scan") {
-    char msg[200];
-    snprintf(msg, sizeof(msg), "R1: %s (%s) | R2: %s (%s) | R3: %s (%s)",
-      radioPresent[1] ? "OK" : "OFF", radioModeName[1].c_str(),
-      radioPresent[2] ? "OK" : "OFF", radioModeName[2].c_str(),
-      radioPresent[3] ? "OK" : "OFF", radioModeName[3].c_str());
+    char msg[250];
+    snprintf(msg, sizeof(msg), "R1: %s (%s %.0fMHz) | R2: %s (%s %.0fMHz) | R3: %s (%s %.0fMHz)",
+      radioPresent[1] ? "OK" : "OFF", radioModeName[1].c_str(), radioFrequency[1],
+      radioPresent[2] ? "OK" : "OFF", radioModeName[2].c_str(), radioFrequency[2],
+      radioPresent[3] ? "OK" : "OFF", radioModeName[3].c_str(), radioFrequency[3]);
     queueNtfy(0, -990, "Radio Scan", msg, true);
+  }
+  else if (cmd.startsWith("freq ")) {
+    int radio = 0;
+    float freq = 0;
+    if (sscanf(cmd.c_str(), "freq %d %f", &radio, &freq) == 2) {
+      if (radio >= 1 && radio <= 3 && radioPresent[radio] && freq > 300 && freq < 930) {
+        radioFrequency[radio] = freq;
+        int csn = (radio == 1) ? CSN1 : (radio == 2) ? CSN2 : CSN3;
+        setupRadio(csn, radio, radioModulation[radio]);
+        mySwitch.enableReceive(digitalPinToInterrupt(getGDO(radio)));
+        char msg[80];
+        snprintf(msg, sizeof(msg), "Radio %d -> %.2f MHz", radio, radioFrequency[radio]);
+        queueNtfy(0, -985, "Freq Changed", msg, true);
+      }
+    }
   }
   else if (cmd == "threshold") {
     char msg[60];
@@ -351,7 +481,7 @@ void handleNtfyCommand(String cmd) {
     queueNtfy(0, -987, "Device Info", msg, true);
   }
   else if (cmd == "help") {
-    queueNtfy(0, -992, "Commands", "status|clear|ntfy on/off|rssi -70|mod 1 2|lock|unlock|scan|threshold|signals|info|reboot|help", true);
+    queueNtfy(0, -992, "Commands", "status|clear|ntfy on/off|rssi -70|mod 1 2|freq 1 868.95|lock|unlock|scan|threshold|signals|info|reboot|help", true);
   }
 }
 
@@ -776,6 +906,23 @@ const char index_html[] PROGMEM = R"rawliteral(
   </style>
   <script>
     setInterval(function() {
+      if (stVisible) fetchStats();
+      fetch('/codebook').then(r => r.json()).then(cb => {
+        document.getElementById('cbCount').textContent = '(' + cb.length + '/50)';
+        if (cbVisible) {
+          var tb = document.getElementById('cbTable');
+          tb.innerHTML = '';
+          if (cb.length === 0) {
+            tb.innerHTML = '<tr><td colspan="9" style="text-align:center; color:var(--text-secondary);">No decoded signals yet</td></tr>';
+          } else {
+            cb.forEach(function(e) {
+              var tr = document.createElement('tr');
+              tr.innerHTML = '<td>' + e.value + '</td><td>' + e.bits + '</td><td>' + e.proto + '</td><td>' + e.rssi + '</td><td>' + e.freq + '</td><td>' + e.hits + '</td><td>' + e.device + '</td><td>' + fmtCbTime(e.first) + '</td><td>' + fmtCbTime(e.last) + '</td>';
+              tb.appendChild(tr);
+            });
+          }
+        }
+      });
       fetch('/data').then(response => response.json()).then(data => {
         let table = document.getElementById("logTable");
         table.innerHTML = "";
@@ -807,13 +954,18 @@ const char index_html[] PROGMEM = R"rawliteral(
       let r1 = document.getElementById("r1").value;
       let r2 = document.getElementById("r2").value;
       let r3 = document.getElementById("r3").value;
-      fetch(`/update?r1=${r1}&r2=${r2}&r3=${r3}`).then(response => {
+      let f1 = document.getElementById("f1").value;
+      let f2 = document.getElementById("f2").value;
+      let f3 = document.getElementById("f3").value;
+      fetch(`/update?r1=${r1}&r2=${r2}&r3=${r3}&f1=${f1}&f2=${f2}&f3=${f3}`).then(response => {
          alert("Settings Updated!");
-         // Refresh UI to match server state
          fetch('/settings').then(response => response.json()).then(data => {
             document.getElementById("r1").value = data.r1;
             document.getElementById("r2").value = data.r2;
             document.getElementById("r3").value = data.r3;
+            document.getElementById("f1").value = data.f1;
+            document.getElementById("f2").value = data.f2;
+            document.getElementById("f3").value = data.f3;
          });
       });
     }
@@ -863,6 +1015,190 @@ const char index_html[] PROGMEM = R"rawliteral(
       localStorage.setItem('theme', isDark ? 'dark' : 'light');
     }
 
+    function fmtCbTime(ts) {
+      if (ts > 1000000000) {
+        var d = new Date(ts * 1000);
+        return String(d.getDate()).padStart(2,'0') + '.' + String(d.getMonth()+1).padStart(2,'0') + '. ' + String(d.getHours()).padStart(2,'0') + ':' + String(d.getMinutes()).padStart(2,'0') + ':' + String(d.getSeconds()).padStart(2,'0');
+      }
+      return ts + 's';
+    }
+    var cbVisible = false;
+    function toggleCodebook() {
+      cbVisible = !cbVisible;
+      document.getElementById('cbPanel').style.display = cbVisible ? 'block' : 'none';
+      document.getElementById('cbToggle').textContent = cbVisible ? 'Hide' : 'Show';
+      if (cbVisible) fetchCodebook();
+    }
+    function fetchCodebook() {
+      fetch('/codebook').then(r => r.json()).then(data => {
+        document.getElementById('cbCount').textContent = '(' + data.length + '/50)';
+        var tb = document.getElementById('cbTable');
+        tb.innerHTML = '';
+        if (data.length === 0) {
+          tb.innerHTML = '<tr><td colspan="9" style="text-align:center; color:var(--text-secondary);">No decoded signals yet</td></tr>';
+          return;
+        }
+        data.forEach(function(e) {
+          var tr = document.createElement('tr');
+          tr.innerHTML = '<td>' + e.value + '</td><td>' + e.bits + '</td><td>' + e.proto + '</td><td>' + e.rssi + '</td><td>' + e.freq + '</td><td>' + e.hits + '</td><td>' + e.device + '</td><td>' + fmtCbTime(e.first) + '</td><td>' + fmtCbTime(e.last) + '</td>';
+          tb.appendChild(tr);
+        });
+      });
+    }
+    function exportCodebook() {
+      fetch('/codebook').then(r => r.json()).then(data => {
+        if (data.length === 0) { alert('Codebook is empty'); return; }
+        var csv = 'Value;Bits;Protocol;RSSI;MHz;Hits;Device;First seen;Last seen\n';
+        data.forEach(function(e) {
+          csv += e.value + ';' + e.bits + ';' + e.proto + ';' + e.rssi + ';' + e.freq + ';' + e.hits + ';' + e.device + ';' + fmtCbTime(e.first) + ';' + fmtCbTime(e.last) + '\n';
+        });
+        var blob = new Blob([csv], {type: 'text/csv;charset=utf-8;'});
+        var a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = 'codebook_' + new Date().toISOString().slice(0,10) + '.csv';
+        a.click();
+      });
+    }
+    function clearCodebook() {
+      document.getElementById('cbTable').innerHTML = '';
+      document.getElementById('cbCount').textContent = '(0)';
+    }
+    function resetCodebook() {
+      if (!confirm('Reset codebook and RSSI history on device?')) return;
+      fetch('/codebook_clear').then(() => {
+        document.getElementById('cbTable').innerHTML = '';
+        document.getElementById('cbCount').textContent = '(0/50)';
+        document.getElementById('rssiDevSel').innerHTML = '<option value="-1">Select device...</option>';
+        var rc = document.getElementById('rssiChart');
+        if (rc) { var ctx = rc.getContext('2d'); ctx.clearRect(0, 0, rc.width, rc.height); }
+        document.getElementById('rssiInfo').textContent = '';
+      });
+    }
+
+    var stVisible = false;
+    function toggleStats() {
+      stVisible = !stVisible;
+      document.getElementById('stPanel').style.display = stVisible ? 'block' : 'none';
+      document.getElementById('stToggle').textContent = stVisible ? 'Hide' : 'Show';
+      if (stVisible) fetchStats();
+    }
+    function fetchStats() {
+      fetch('/stats').then(r => r.json()).then(s => {
+        document.getElementById('stDecoded').textContent = s.decoded;
+        document.getElementById('stRaw').textContent = s.raw;
+        var u = s.uptime;
+        var uh = Math.floor(u/3600); var um = Math.floor((u%3600)/60); var us = u%60;
+        document.getElementById('stUptime').textContent = (uh > 0 ? uh+'h ' : '') + um + 'm ' + us + 's';
+        document.getElementById('stCb').textContent = s.cbUsed + '/50';
+        document.getElementById('stR1').textContent = s.rd[1] + '/' + s.rr[1];
+        document.getElementById('stR2').textContent = s.rd[2] + '/' + s.rr[2];
+        document.getElementById('stR3').textContent = s.rd[3] + '/' + s.rr[3];
+        var topHtml = '';
+        s.top.forEach(function(t, i) {
+          topHtml += '<div style="display:flex; justify-content:space-between; padding:2px 0; border-bottom:1px solid var(--border);"><span>' + (i+1) + '. ' + t.d + '</span><span style="color:#28a745; font-weight:bold;">' + t.h + 'x</span></div>';
+        });
+        if (s.top.length === 0) topHtml = '<div style="color:var(--text-secondary);">No data yet</div>';
+        document.getElementById('stTop').innerHTML = topHtml;
+        drawHourlyChart(s.hd, s.hr);
+        updateRssiDevSelect();
+      });
+    }
+    function drawHourlyChart(hd, hr) {
+      var c = document.getElementById('hourlyChart');
+      var ctx = c.getContext('2d');
+      c.width = c.offsetWidth * 2;
+      c.height = 200;
+      ctx.clearRect(0, 0, c.width, c.height);
+      var max = 1;
+      for (var i = 0; i < 24; i++) { if (hd[i] > max) max = hd[i]; if (hr[i] > max) max = hr[i]; }
+      var bw = (c.width - 40) / 24;
+      var h = c.height - 30;
+      ctx.font = (bw > 16 ? 16 : 12) + 'px sans-serif';
+      ctx.fillStyle = getComputedStyle(document.body).getPropertyValue('--text-secondary') || '#888';
+      for (var i = 0; i < 24; i++) {
+        var x = 20 + i * bw;
+        var dh = (hd[i] / max) * h;
+        var rh = (hr[i] / max) * h;
+        ctx.fillStyle = 'rgba(40,167,69,0.7)';
+        ctx.fillRect(x + 1, c.height - 20 - dh, bw/2 - 1, dh);
+        ctx.fillStyle = 'rgba(255,193,7,0.5)';
+        ctx.fillRect(x + bw/2, c.height - 20 - rh, bw/2 - 1, rh);
+        ctx.fillStyle = getComputedStyle(document.body).getPropertyValue('--text-secondary') || '#888';
+        if (i % 3 === 0) ctx.fillText(i + 'h', x, c.height - 4);
+      }
+    }
+    function updateRssiDevSelect() {
+      fetch('/codebook').then(r => r.json()).then(cb => {
+        var sel = document.getElementById('rssiDevSel');
+        var cur = sel.value;
+        sel.innerHTML = '<option value="-1">Select device...</option>';
+        cb.forEach(function(e, i) {
+          var opt = document.createElement('option');
+          opt.value = i;
+          opt.textContent = e.value + ' (' + e.device + ')';
+          sel.appendChild(opt);
+        });
+        sel.value = cur;
+      });
+    }
+    function loadRssiHist() {
+      var idx = document.getElementById('rssiDevSel').value;
+      if (idx < 0) { document.getElementById('rssiInfo').textContent = 'Select a device first'; return; }
+      fetch('/rssi_hist?i=' + idx).then(r => r.json()).then(data => {
+        document.getElementById('rssiInfo').textContent = data.device + ' (value: ' + data.value + ') - ' + data.data.length + ' readings';
+        drawRssiChart(data.data);
+      });
+    }
+    function drawRssiChart(data) {
+      var c = document.getElementById('rssiChart');
+      var ctx = c.getContext('2d');
+      c.width = c.offsetWidth * 2;
+      c.height = 240;
+      ctx.clearRect(0, 0, c.width, c.height);
+      if (data.length === 0) {
+        ctx.fillStyle = getComputedStyle(document.body).getPropertyValue('--text-secondary') || '#888';
+        ctx.font = '20px sans-serif';
+        ctx.fillText('No RSSI data yet', c.width/2 - 80, c.height/2);
+        return;
+      }
+      var minR = -100, maxR = -20;
+      var w = c.width - 60, h = c.height - 40;
+      ctx.strokeStyle = 'rgba(0,123,255,0.3)';
+      ctx.lineWidth = 1;
+      for (var db = -100; db <= -20; db += 20) {
+        var y = 20 + h - ((db - minR) / (maxR - minR)) * h;
+        ctx.beginPath(); ctx.moveTo(50, y); ctx.lineTo(c.width - 10, y); ctx.stroke();
+        ctx.fillStyle = getComputedStyle(document.body).getPropertyValue('--text-secondary') || '#888';
+        ctx.font = '16px sans-serif';
+        ctx.fillText(db + '', 2, y + 5);
+      }
+      ctx.strokeStyle = '#007bff';
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      data.forEach(function(p, i) {
+        var x = 50 + (i / (data.length - 1 || 1)) * w;
+        var y = 20 + h - ((p.r - minR) / (maxR - minR)) * h;
+        if (i === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      });
+      ctx.stroke();
+      ctx.fillStyle = '#007bff';
+      data.forEach(function(p, i) {
+        var x = 50 + (i / (data.length - 1 || 1)) * w;
+        var y = 20 + h - ((p.r - minR) / (maxR - minR)) * h;
+        ctx.beginPath(); ctx.arc(x, y, 5, 0, Math.PI*2); ctx.fill();
+      });
+      ctx.fillStyle = getComputedStyle(document.body).getPropertyValue('--text-secondary') || '#888';
+      ctx.font = '14px sans-serif';
+      data.forEach(function(p, i) {
+        if (i === 0 || i === data.length - 1) {
+          var x = 50 + (i / (data.length - 1 || 1)) * w;
+          var tStr = p.t > 1000000000 ? new Date(p.t*1000).toLocaleTimeString() : p.t + 's';
+          ctx.fillText(tStr, x - 20, c.height - 4);
+        }
+      });
+    }
+
     // Load current settings on page load
     window.onload = function() {
         // Theme from local storage
@@ -875,9 +1211,11 @@ const char index_html[] PROGMEM = R"rawliteral(
             document.getElementById("r1").value = data.r1;
             document.getElementById("r2").value = data.r2;
             document.getElementById("r3").value = data.r3;
+            document.getElementById("f1").value = data.f1;
+            document.getElementById("f2").value = data.f2;
+            document.getElementById("f3").value = data.f3;
             document.getElementById("rssiSlider").value = data.rssi;
             updateRssiLabel(data.rssi);
-            // Color radio labels: green = connected, gray = not found
             ['r1','r2','r3'].forEach(function(id, i) {
                 var lbl = document.getElementById('lbl_' + id);
                 var present = data['p' + (i+1)];
@@ -885,7 +1223,6 @@ const char index_html[] PROGMEM = R"rawliteral(
                     lbl.style.color = present ? '#28a745' : '#999';
                 }
             });
-            // ntfy + STA status from server
             var nbtn = document.getElementById('ntfyBtn');
             var staText = data.sta ? '' : ' (no WiFi)';
             nbtn.style.background = data.ntfy ? '#28a745' : '#6c757d';
@@ -903,6 +1240,13 @@ const char index_html[] PROGMEM = R"rawliteral(
     
     <div class="control-group">
       <label id="lbl_r1">Radio 1:</label>
+      <select id="f1" style="width:90px;">
+        <option value="315.00">315.00</option>
+        <option value="433.92" selected>433.92</option>
+        <option value="868.00">868.00</option>
+        <option value="868.35">868.35</option>
+        <option value="868.95">868.95</option>
+      </select>
       <select id="r1">
         <option value="2">ASK/OOK</option>
         <option value="0">2-FSK</option>
@@ -914,6 +1258,13 @@ const char index_html[] PROGMEM = R"rawliteral(
     
     <div class="control-group">
       <label id="lbl_r2">Radio 2:</label>
+      <select id="f2" style="width:90px;">
+        <option value="315.00">315.00</option>
+        <option value="433.92" selected>433.92</option>
+        <option value="868.00">868.00</option>
+        <option value="868.35">868.35</option>
+        <option value="868.95">868.95</option>
+      </select>
       <select id="r2">
         <option value="2">ASK/OOK</option>
         <option value="0">2-FSK</option>
@@ -925,6 +1276,13 @@ const char index_html[] PROGMEM = R"rawliteral(
     
     <div class="control-group">
       <label id="lbl_r3">Radio 3:</label>
+      <select id="f3" style="width:90px;">
+        <option value="315.00">315.00</option>
+        <option value="433.92" selected>433.92</option>
+        <option value="868.00">868.00</option>
+        <option value="868.35">868.35</option>
+        <option value="868.95">868.95</option>
+      </select>
       <select id="r3">
         <option value="2">ASK/OOK</option>
         <option value="0">2-FSK</option>
@@ -948,6 +1306,82 @@ const char index_html[] PROGMEM = R"rawliteral(
       <input type="range" id="rssiSlider" min="-100" max="-30" value="-60" disabled style="flex:1; height:20px;" oninput="updateRssiLabel(this.value)">
       <button id="lockBtn" onclick="toggleLock()" style="width:32px; min-width:32px; height:32px; margin:0; padding:4px; font-size:0.9rem; border-radius:6px; background:#dc3545;">&#128274;</button>
       <button onclick="setRssi()" style="width:auto; min-width:50px; margin:0; padding:6px 10px; font-size:0.75rem; border-radius:6px;">Set</button>
+    </div>
+  </div>
+
+  <div class="settings" style="padding:8px; gap:5px;">
+    <div style="display:flex; align-items:center; justify-content:space-between;">
+      <div style="font-size:0.8rem; font-weight:bold; color:var(--text-secondary);">
+        CODEBOOK <span id="cbCount" style="font-weight:normal;">(0)</span>
+      </div>
+      <div style="display:flex; gap:4px;">
+        <button onclick="toggleCodebook()" id="cbToggle" style="width:auto; min-width:50px; margin:0; padding:4px 10px; font-size:0.75rem; border-radius:6px;">Show</button>
+        <button onclick="exportCodebook()" style="width:auto; min-width:50px; margin:0; padding:4px 10px; font-size:0.75rem; border-radius:6px; background:#17a2b8;">Export</button>
+        <button onclick="clearCodebook()" style="width:auto; min-width:50px; margin:0; padding:4px 10px; font-size:0.75rem; border-radius:6px; background:#6c757d;">Clear view</button>
+        <button onclick="resetCodebook()" style="width:auto; min-width:50px; margin:0; padding:4px 10px; font-size:0.75rem; border-radius:6px; background:#dc3545;">Reset</button>
+      </div>
+    </div>
+    <div id="cbPanel" style="display:none; margin-top:6px;">
+      <div style="overflow-x:auto;">
+        <table>
+          <thead><tr><th>Value</th><th>Bits</th><th>Proto</th><th>RSSI</th><th>MHz</th><th>Hits</th><th>Device</th><th>First seen</th><th>Last seen</th></tr></thead>
+          <tbody id="cbTable"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <div class="settings" style="padding:8px; gap:5px;">
+    <div style="display:flex; align-items:center; justify-content:space-between;">
+      <div style="font-size:0.8rem; font-weight:bold; color:var(--text-secondary);">STATISTICS</div>
+      <button onclick="toggleStats()" id="stToggle" style="width:auto; min-width:50px; margin:0; padding:4px 10px; font-size:0.75rem; border-radius:6px;">Show</button>
+    </div>
+    <div id="stPanel" style="display:none; margin-top:6px;">
+      <div style="display:grid; grid-template-columns:1fr 1fr; gap:6px; margin-bottom:8px;">
+        <div style="background:var(--bg); border-radius:8px; padding:8px; text-align:center;">
+          <div style="font-size:0.7rem; color:var(--text-secondary);">Decoded</div>
+          <div id="stDecoded" style="font-size:1.3rem; font-weight:bold; color:#28a745;">0</div>
+        </div>
+        <div style="background:var(--bg); border-radius:8px; padding:8px; text-align:center;">
+          <div style="font-size:0.7rem; color:var(--text-secondary);">RAW</div>
+          <div id="stRaw" style="font-size:1.3rem; font-weight:bold; color:#ffc107;">0</div>
+        </div>
+      </div>
+      <div style="display:grid; grid-template-columns:1fr 1fr 1fr; gap:6px; margin-bottom:8px;">
+        <div style="background:var(--bg); border-radius:8px; padding:6px; text-align:center;">
+          <div style="font-size:0.65rem; color:#ff4d4d;">R1</div>
+          <div id="stR1" style="font-size:0.9rem; font-weight:bold;">0/0</div>
+        </div>
+        <div style="background:var(--bg); border-radius:8px; padding:6px; text-align:center;">
+          <div style="font-size:0.65rem; color:#4dff4d;">R2</div>
+          <div id="stR2" style="font-size:0.9rem; font-weight:bold;">0/0</div>
+        </div>
+        <div style="background:var(--bg); border-radius:8px; padding:6px; text-align:center;">
+          <div style="font-size:0.65rem; color:#4d4dff;">R3</div>
+          <div id="stR3" style="font-size:0.9rem; font-weight:bold;">0/0</div>
+        </div>
+      </div>
+      <div style="font-size:0.7rem; color:var(--text-secondary); margin-bottom:4px;">Uptime: <span id="stUptime">0s</span> | Codebook: <span id="stCb">0/50</span></div>
+      <div style="font-size:0.7rem; font-weight:bold; color:var(--text-secondary); margin:6px 0 4px;">Top devices:</div>
+      <div id="stTop" style="font-size:0.75rem;"></div>
+      <div style="font-size:0.7rem; font-weight:bold; color:var(--text-secondary); margin:8px 0 4px;">Signals per hour (decoded):</div>
+      <canvas id="hourlyChart" width="300" height="100" style="width:100%; height:100px; background:var(--bg); border-radius:8px;"></canvas>
+    </div>
+  </div>
+
+  <div class="settings" style="padding:8px; gap:5px;">
+    <div style="display:flex; align-items:center; justify-content:space-between;">
+      <div style="font-size:0.8rem; font-weight:bold; color:var(--text-secondary);">RSSI HISTORY</div>
+      <div style="display:flex; gap:4px; align-items:center;">
+        <select id="rssiDevSel" style="width:120px; padding:2px 4px; font-size:0.7rem; border-radius:6px; border:1px solid var(--input-border); background:var(--input-bg); color:var(--text);">
+          <option value="-1">Select device...</option>
+        </select>
+        <button onclick="loadRssiHist()" style="width:auto; min-width:40px; margin:0; padding:4px 8px; font-size:0.75rem; border-radius:6px;">Load</button>
+      </div>
+    </div>
+    <div id="rssiPanel" style="margin-top:6px;">
+      <div id="rssiInfo" style="font-size:0.7rem; color:var(--text-secondary); margin-bottom:4px;"></div>
+      <canvas id="rssiChart" width="300" height="120" style="width:100%; height:120px; background:var(--bg); border-radius:8px;"></canvas>
     </div>
   </div>
 
@@ -985,7 +1419,7 @@ void setupRadio(int csnPin, int radioId, int modulation) {
   selectRadio(csnPin);
   
   if (ELECHOUSE_cc1101.getCC1101()) {
-    Serial.printf("Radio %d (CSN %d) OK -> Mod: %d\n", radioId, csnPin, modulation);
+    Serial.printf("Radio %d (CSN %d) OK -> Mod: %d, Freq: %.2f MHz\n", radioId, csnPin, modulation, radioFrequency[radioId]);
     radioPresent[radioId] = true;
   } else {
     Serial.printf("Radio %d (CSN %d) ERROR - Not Found\n", radioId, csnPin);
@@ -996,7 +1430,7 @@ void setupRadio(int csnPin, int radioId, int modulation) {
   ELECHOUSE_cc1101.Init();
   
   ELECHOUSE_cc1101.setModulation(modulation); 
-  ELECHOUSE_cc1101.setMHZ(433.92);
+  ELECHOUSE_cc1101.setMHZ(radioFrequency[radioId]);
   
   if (modulation == 0 || modulation == 1) { // FSK / GFSK
       ELECHOUSE_cc1101.setDeviation(47.60);   
@@ -1013,17 +1447,22 @@ void setupRadio(int csnPin, int radioId, int modulation) {
       radioModeName[radioId] = "Wideband ASK";
   }
   else { // ASK/OOK (2)
+      ELECHOUSE_cc1101.setRxBW(325.0);
       radioModeName[radioId] = "ASK/OOK";
   }
   
   radioModulation[radioId] = modulation;
   
   ELECHOUSE_cc1101.SetRx();
-  digitalWrite(csnPin, HIGH); 
+  digitalWrite(csnPin, HIGH);
+  rawCooldown = 30;
+  rawConfirmCount = 0;
 }
 
 void setup() {
   Serial.begin(115200);
+  statsInit();
+  memset(rssiHist, 0, sizeof(rssiHist));
   
   // Configure CSN pins as outputs
   pinMode(CSN1, OUTPUT); digitalWrite(CSN1, HIGH);
@@ -1063,8 +1502,18 @@ void setup() {
   });
   
   server.on("/update", []() {
+    if (server.hasArg("f1")) {
+       radioFrequency[1] = server.arg("f1").toFloat();
+    }
+    if (server.hasArg("f2")) {
+       radioFrequency[2] = server.arg("f2").toFloat();
+    }
+    if (server.hasArg("f3")) {
+       radioFrequency[3] = server.arg("f3").toFloat();
+    }
     if (server.hasArg("r1")) {
        int m = server.arg("r1").toInt();
+       radioModulation[1] = m;
        if (radioPresent[1]) {
          setupRadio(CSN1, 1, m);
          mySwitch.enableReceive(digitalPinToInterrupt(GDO1));
@@ -1072,6 +1521,7 @@ void setup() {
     }
     if (server.hasArg("r2")) {
        int m = server.arg("r2").toInt();
+       radioModulation[2] = m;
        if (radioPresent[2]) {
          setupRadio(CSN2, 2, m);
          mySwitch.enableReceive(digitalPinToInterrupt(GDO2));
@@ -1079,6 +1529,7 @@ void setup() {
     }
     if (server.hasArg("r3")) {
        int m = server.arg("r3").toInt();
+       radioModulation[3] = m;
        if (radioPresent[3]) {
          setupRadio(CSN3, 3, m);
          mySwitch.enableReceive(digitalPinToInterrupt(GDO3));
@@ -1121,6 +1572,9 @@ void setup() {
       json += "\"r1\":" + String(radioModulation[1]) + ",";
       json += "\"r2\":" + String(radioModulation[2]) + ",";
       json += "\"r3\":" + String(radioModulation[3]) + ",";
+      json += "\"f1\":\"" + String(radioFrequency[1], 2) + "\",";
+      json += "\"f2\":\"" + String(radioFrequency[2], 2) + "\",";
+      json += "\"f3\":\"" + String(radioFrequency[3], 2) + "\",";
       json += "\"rssi\":" + String(rssiThreshold) + ",";
       json += "\"p1\":" + String(radioPresent[1] ? "true" : "false") + ",";
       json += "\"p2\":" + String(radioPresent[2] ? "true" : "false") + ",";
@@ -1164,6 +1618,94 @@ void setup() {
       count++;
     }
     json += "]";
+    server.send(200, "application/json", json);
+  });
+
+  server.on("/codebook", []() {
+    String json = "[";
+    for (int i = 0; i < codebookCount; i++) {
+      if (i > 0) json += ",";
+      json += "{";
+      json += "\"value\":" + String(codebook[i].value);
+      json += ",\"bits\":" + String(codebook[i].bitLength);
+      json += ",\"proto\":" + String(codebook[i].protocol);
+      json += ",\"rssi\":" + String(codebook[i].rssi);
+      json += ",\"freq\":\"" + String(codebook[i].frequency, 2) + "\"";
+      json += ",\"first\":" + String(codebook[i].firstSeen);
+      json += ",\"last\":" + String(codebook[i].lastSeen);
+      json += ",\"hits\":" + String(codebook[i].hitCount);
+      json += ",\"device\":\"" + String(codebook[i].deviceType) + "\"";
+      json += "}";
+    }
+    json += "]";
+    server.send(200, "application/json", json);
+  });
+
+  server.on("/codebook_clear", []() {
+    codebookCount = 0;
+    memset(codebook, 0, sizeof(codebook));
+    memset(rssiHist, 0, sizeof(rssiHist));
+    statsInit();
+    server.send(200, "text/plain", "OK");
+    Serial.println("Codebook & statistics cleared");
+  });
+
+  server.on("/stats", []() {
+    unsigned long upSec = (millis() - stats.uptimeStart) / 1000;
+    String json = "{";
+    json += "\"decoded\":" + String(stats.totalDecoded);
+    json += ",\"raw\":" + String(stats.totalRaw);
+    json += ",\"uptime\":" + String(upSec);
+    json += ",\"cbUsed\":" + String(codebookCount);
+    json += ",\"rd\":[0," + String(stats.radioDecoded[1]) + "," + String(stats.radioDecoded[2]) + "," + String(stats.radioDecoded[3]) + "]";
+    json += ",\"rr\":[0," + String(stats.radioRaw[1]) + "," + String(stats.radioRaw[2]) + "," + String(stats.radioRaw[3]) + "]";
+    json += ",\"hd\":[";
+    for (int i = 0; i < 24; i++) {
+      if (i > 0) json += ",";
+      json += String(stats.hourlyDecoded[i]);
+    }
+    json += "],\"hr\":[";
+    for (int i = 0; i < 24; i++) {
+      if (i > 0) json += ",";
+      json += String(stats.hourlyRaw[i]);
+    }
+    json += "]";
+    // top 5 most active devices from codebook
+    json += ",\"top\":[";
+    int indices[CODEBOOK_SIZE];
+    for (int i = 0; i < codebookCount; i++) indices[i] = i;
+    for (int i = 0; i < codebookCount - 1; i++) {
+      for (int j = i + 1; j < codebookCount; j++) {
+        if (codebook[indices[j]].hitCount > codebook[indices[i]].hitCount) {
+          int tmp = indices[i]; indices[i] = indices[j]; indices[j] = tmp;
+        }
+      }
+    }
+    int topN = codebookCount < 5 ? codebookCount : 5;
+    for (int i = 0; i < topN; i++) {
+      int idx = indices[i];
+      if (i > 0) json += ",";
+      json += "{\"v\":" + String(codebook[idx].value) + ",\"d\":\"" + String(codebook[idx].deviceType) + "\",\"h\":" + String(codebook[idx].hitCount) + "}";
+    }
+    json += "]}";
+    server.send(200, "application/json", json);
+  });
+
+  server.on("/rssi_hist", []() {
+    int idx = -1;
+    if (server.hasArg("i")) idx = server.arg("i").toInt();
+    if (idx < 0 || idx >= codebookCount) {
+      server.send(400, "text/plain", "Invalid index");
+      return;
+    }
+    String json = "{\"value\":" + String(codebook[idx].value);
+    json += ",\"device\":\"" + String(codebook[idx].deviceType) + "\"";
+    json += ",\"data\":[";
+    for (int i = 0; i < rssiHist[idx].count; i++) {
+      if (i > 0) json += ",";
+      json += "{\"t\":" + String(rssiHist[idx].ts[i]) + ",\"r\":" + String(rssiHist[idx].rssi[i]) + "}";
+    }
+    json += "]}";
     server.send(200, "application/json", json);
   });
 
@@ -1220,9 +1762,6 @@ void loop() {
   }
 
   // Check RCSwitch EVERY loop iteration (not just every 50ms)
-  static int rawCooldown = 0;
-  static int rawConfirmCount = 0;
-  
   if (mySwitch.available()) {
       long value = mySwitch.getReceivedValue();
       if (value != 0) {
@@ -1240,6 +1779,9 @@ void loop() {
             history[historyIndex].rssi = rssi;
             history[historyIndex].rawDetection = false;
             identifyDevice(proto, bits, value, radioModulation[activeRadio], history[historyIndex].deviceType);
+            int cbIdx = codebookAdd(value, bits, proto, rssi, radioFrequency[activeRadio], history[historyIndex].deviceType);
+            rssiHistAdd(cbIdx, rssi);
+            statsRecord(activeRadio, false);
             historyIndex = (historyIndex + 1) % HISTORY_SIZE;
             Serial.printf("Radio %d DECODED: %ld (%s)\n", activeRadio, value, history[(historyIndex-1+HISTORY_SIZE)%HISTORY_SIZE].deviceType);
           }
@@ -1275,6 +1817,7 @@ void loop() {
                 history[historyIndex].rssi = rssi;
                 history[historyIndex].rawDetection = true;
                 strcpy(history[historyIndex].deviceType, "RAW/Rolling");
+                statsRecord(activeRadio, true);
                 historyIndex = (historyIndex + 1) % HISTORY_SIZE;
                 Serial.printf("Radio %d RAW: RSSI %d dBm\n", activeRadio, rssi);
               }
